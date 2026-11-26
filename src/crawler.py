@@ -14,7 +14,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.keys import Keys
-#from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.chrome import ChromeDriverManager
 
 from src.gmail_otp_fetcher import get_linkedin_otp_from_gmail
 
@@ -64,7 +64,7 @@ class LinkedInCrawler:
 
         self.driver = webdriver.Chrome(service=Service(executable_path="/usr/bin/chromedriver"), options=chrome_options)
 
-        #self.driver = webdriver.Chrome(options=chrome_options)
+        # self.driver = webdriver.Chrome(options=chrome_options)
         #self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
 
     def close_driver(self):
@@ -194,6 +194,124 @@ class LinkedInCrawler:
         except Exception as e:
             print(f"[WARNING] Failed while checking restored session: {e}")
             return False
+
+    OTP_PAGE_TEXTS = [
+        "We sent a code to your email",
+        "Kami telah mengirim kode ke email Anda",  # tebakan versi Indonesia, sesuaikan kalau UI akun Bahasa Indonesia
+    ]
+
+    def find_otp_input(self, timeout: int = 10):
+        """Tunggu input OTP (popup) muncul lalu kembalikan elemennya."""
+        selectors = [
+            "input[autocomplete='one-time-code']",   # utama (popup baru)
+            "input[placeholder='------']",
+            "[role='dialog'] input[type='text']",
+            "#input__email_verification_pin",         # fallback halaman lama
+            "input[name='pin']",
+            "input.input_verification_pin",
+            "input[inputmode='numeric']",
+            "input[type='tel']",
+        ]
+        end = time.time() + timeout
+        while time.time() < end:
+            for sel in selectors:
+                try:
+                    for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                        if el.is_displayed():
+                            return el
+                except Exception:
+                    pass
+            time.sleep(0.5)
+        return None
+
+    def is_otp_challenge_page(self) -> bool:
+        if "checkpoint/challenge" in self.driver.current_url:
+            return True
+
+        # Popup OTP: input one-time-code terlihat
+        try:
+            for el in self.driver.find_elements(By.CSS_SELECTOR, "input[autocomplete='one-time-code']"):
+                if el.is_displayed():
+                    return True
+        except Exception:
+            pass
+
+        # Fallback: teks di popup/halaman
+        for text in self.OTP_PAGE_TEXTS:
+            xpath = f"//*[contains(normalize-space(text()), \"{text}\")]"
+            try:
+                if self.driver.find_elements(By.XPATH, xpath):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def wait_for_otp_challenge(self, timeout: int = 15) -> bool:
+        """
+        Popup bisa muncul di atas halaman feed, jadi jangan langsung menyerah
+        saat URL sudah /feed. Beri grace period beberapa detik.
+        """
+        end = time.time() + timeout
+        feed_seen_at = None
+        while time.time() < end:
+            if self.is_otp_challenge_page():
+                return True
+            if "linkedin.com/feed" in self.driver.current_url:
+                if feed_seen_at is None:
+                    feed_seen_at = time.time()
+                elif time.time() - feed_seen_at > 4:
+                    return False
+            time.sleep(1)
+        return False
+
+    def submit_otp(self, pin_field):
+        try:
+            pin_field.send_keys(Keys.RETURN)
+            print("[INFO] Enter key sent natively for OTP.")
+            return
+        except Exception as e:
+            print(f"[WARNING] Native Enter for OTP failed ({type(e).__name__}), trying submit button...")
+
+        button_xpath = (
+            "//button[contains(., 'Submit') or contains(., 'Verify') "
+            "or contains(., 'Kirim') or contains(., 'Verifikasi')]"
+        )
+        for btn in self.driver.find_elements(By.XPATH, button_xpath):
+            if btn.is_displayed() and btn.is_enabled():
+                self.driver.execute_script("arguments[0].click();", btn)
+                print("[INFO] OTP submit button clicked.")
+                return
+
+    def handle_otp_challenge(self, fill_field):
+        print("\n=== VERIFICATION CHALLENGE (OTP) DETECTED ===")
+        print("URL:", self.driver.current_url)
+
+        pin_field = self.find_otp_input()
+        if pin_field is None:
+            os.makedirs(self.debug_dir, exist_ok=True)
+            self.driver.save_screenshot(os.path.join(self.debug_dir, "debug_checkpoint_page.png"))
+            with open(os.path.join(self.debug_dir, "debug_checkpoint_page.html"), "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+            print("[WARNING] Verification PIN field not found. Saved checkpoint debug info.")
+            return
+
+        print("[INFO] Mengambil kode OTP dari Gmail...")
+        otp_code = get_linkedin_otp_from_gmail(
+            gmail_user=os.getenv("GMAIL_USER"),
+            gmail_app_password=os.getenv("GMAIL_APP_PASSWORD"),
+            max_wait_seconds=90,
+        )
+
+        if otp_code is None:
+            print("[WARNING] OTP tidak ditemukan dari Gmail dalam batas waktu. Skip pengisian OTP.")
+            os.makedirs(self.debug_dir, exist_ok=True)
+            self.driver.save_screenshot(os.path.join(self.debug_dir, "debug_otp_timeout.png"))
+            return
+
+        print(f"[INFO] OTP ditemukan: {otp_code}")
+        fill_field(pin_field, otp_code, "kode OTP")
+        self.submit_otp(pin_field)
+        time.sleep(5)
 
     def login(self) -> int:
         available_account = None
@@ -335,64 +453,9 @@ class LinkedInCrawler:
                     # Wait for redirection/challenge
                     time.sleep(5)
 
-                    # Check for checkpoint/challenge
-                    if "checkpoint/challenge" in self.driver.current_url:
-                        print("\n=== VERIFICATION CHALLENGE (OTP) DETECTED ===")
-                        print("URL:", self.driver.current_url)
-
-                        pin_selectors = [
-                            "#input__email_verification_pin",
-                            "input[name='pin']",
-                            "input.input_verification_pin",
-                        ]
-                        pin_field = find_first(pin_selectors)
-
-                        if pin_field is None:
-                            os.makedirs(self.debug_dir, exist_ok=True)
-                            self.driver.save_screenshot(os.path.join(self.debug_dir, "debug_checkpoint_page.png"))
-                            with open(os.path.join(self.debug_dir, "debug_checkpoint_page.html"), "w", encoding="utf-8") as f:
-                                f.write(self.driver.page_source)
-                            print("[WARNING] Verification PIN field not found. Saved checkpoint debug info.")
-                        else:
-                            print("[INFO] Mengambil kode OTP dari Gmail...")
-                            otp_code = get_linkedin_otp_from_gmail(
-                                gmail_user=os.getenv("GMAIL_USER"),
-                                gmail_app_password=os.getenv("GMAIL_APP_PASSWORD"),
-                                max_wait_seconds=90,
-                            )
-
-                            if otp_code is None:
-                                print("[WARNING] OTP tidak ditemukan dari Gmail dalam batas waktu. Skip pengisian OTP.")
-                                os.makedirs(self.debug_dir, exist_ok=True)
-                                self.driver.save_screenshot(os.path.join(self.debug_dir, "debug_otp_timeout.png"))
-                            else:
-                                print(f"[INFO] OTP ditemukan: {otp_code}")
-                                fill_field(pin_field, otp_code, "kode OTP")
-
-                                try:
-                                    pin_field.send_keys(Keys.RETURN)
-                                    print("[INFO] Enter key sent natively for OTP.")
-                                except Exception as e:
-                                    print(f"[WARNING] Native Enter for OTP failed ({type(e).__name__}), falling back to JS dispatch...")
-                                    self.driver.execute_script(
-                                        """
-                                        const el = arguments[0];
-                                        el.focus();
-                                        for (const type of ['keydown', 'keypress', 'keyup']) {
-                                            el.dispatchEvent(new KeyboardEvent(type, {
-                                                key: 'Enter',
-                                                code: 'Enter',
-                                                keyCode: 13,
-                                                which: 13,
-                                                bubbles: true,
-                                                cancelable: true,
-                                            }));
-                                        }
-                                        """,
-                                        pin_field,
-                                    )
-                                print("[INFO] Enter key sent via JS dispatch for OTP.")
-                            time.sleep(5)
+                    # Deteksi OTP lewat teks halaman / popup (URL checkpoint sudah tidak dipakai)
+                    if self.wait_for_otp_challenge(timeout=15):
+                        self.handle_otp_challenge(fill_field)
 
         except Exception as e:
             print(f"[DEBUG] Error pas isi form / OTP: {e}")
